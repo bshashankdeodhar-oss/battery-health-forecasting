@@ -42,44 +42,136 @@ FEATURE_COLUMNS = [
 # ─────────────────────────────────────────────────────────────────
 # 2. SoH and RUL Computation
 # ─────────────────────────────────────────────────────────────────
+def _is_variable_dod(capacities: np.ndarray, threshold: float = 0.50) -> bool:
+    """
+    Detect if a battery uses a Variable Depth-of-Discharge (VDoD) protocol.
+
+    Satellite batteries interleave full reference discharges (~2 Ah) with
+    short partial discharges (0.1–1.9 Ah). The signature is a very wide
+    spread in per-cycle capacity:  cap_min / cap_max < 0.50.
+
+    Normal batteries (2C, 3C, R2.5, R3, RW) discharge close to their full
+    nominal capacity every cycle, so cap_min / cap_max > 0.70.
+    """
+    cap_min = np.nanmin(capacities)
+    cap_max = np.nanmax(capacities)
+    if cap_max <= 0:
+        return False
+    return (cap_min / cap_max) < threshold
+
+
+def _impute_vdod_capacities(
+    capacities: np.ndarray,
+    full_cycle_min_frac: float = 0.70,
+) -> np.ndarray:
+    """
+    For VDoD (satellite-type) batteries: replace partial-discharge cycle
+    capacities with the capacity of the last full reference cycle.
+
+    This converts the mix of [1.991, 0.111, 0.445, 1.922, 0.756, ...]
+    into    [1.991, 1.991, 1.991, 1.922, 1.922, ...]
+    so that SoH = imputed_cap / cap_init tracks actual capacity FADE
+    (from the reference cycles) rather than per-cycle DoD.
+
+    Args:
+        capacities:          Raw per-cycle discharge capacity array.
+        full_cycle_min_frac: Cycle is 'full' if cap >= this * max_cap.
+
+    Returns:
+        Array of same length with partial cycles filled from last reference.
+    """
+    peak_cap = np.nanmax(capacities)
+    is_full = capacities >= full_cycle_min_frac * peak_cap
+
+    imputed = capacities.copy().astype(np.float64)
+    last_ref = float(capacities[is_full][0]) if np.any(is_full) else float(capacities[0])
+
+    for i in range(len(imputed)):
+        if is_full[i]:
+            last_ref = float(imputed[i])      # update reference with latest full cycle
+        else:
+            imputed[i] = last_ref             # substitute partial cycle with reference
+
+    return imputed
+
+
 def compute_soh_rul(
     capacities: np.ndarray,
     eol_threshold: float = config.EOL_SOH_THRESHOLD,
+    battery_id: str = "",
+    verbose_diag: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
-    Compute State-of-Health and Remaining Useful Life arrays for one battery.
+    Compute State-of-Health and Remaining Useful Life for one battery.
 
-    SoH  = capacity[k] / capacity[0]     (handles NaN gracefully)
-    EOL  = first index where SoH <= eol_threshold
-    RUL  = EOL_cycle - k   (clipped to 0 after EOL)
+    SoH FORMULA (unchanged for all normal batteries):
+        SoH[k] = discharge_capacity[k] / cap_init
+
+    TARGETED VDoD FIX (satellite batteries only):
+        Detected by cap_min / cap_max < 0.50 (wide DoD spread).
+        Partial-discharge cycles are forward-filled from the last
+        full reference cycle before applying SoH = cap / cap_init.
+        This preserves degradation in the reference cycles without
+        the 0.056 fake-collapse from a 0.111 Ah partial discharge.
 
     Args:
-        capacities:    1-D array of discharge capacities (Ah) ordered by cycle.
+        capacities:    1-D array of per-cycle discharge capacity (Ah).
         eol_threshold: SoH fraction defining end-of-life (default 0.80).
+        battery_id:    Battery name string for diagnostic prints.
+        verbose_diag:  If True, print first/last 10 capacities and SoH bounds.
 
     Returns:
         (soh_array, rul_array, eol_cycle_index)
     """
-    # Replace NaN with forward-fill then back-fill
+    # ── 1. NaN imputation ────────────────────────────────────────────────
     caps = pd.Series(capacities, dtype=np.float64).ffill().bfill().values
+    n = len(caps)
 
-    initial_cap = float(caps[0])
-    if initial_cap <= 0:
-        raise ValueError(f"Initial capacity must be > 0, got {initial_cap}.")
+    if caps[0] <= 0:
+        raise ValueError(f"[{battery_id}] Initial capacity <= 0 ({caps[0]:.4f} Ah).")
 
-    soh = caps / initial_cap
+    # ── 2. Targeted VDoD fix (satellite batteries only, explicit rule) ──
+    if "satellite" in battery_id.lower():
+        working_caps = _impute_vdod_capacities(caps)
+        vdod_flag = True
+    else:
+        working_caps = caps
+        vdod_flag = False
 
-    # Find EOL
+    # ── 3. Original SoH formula — unchanged for all batteries ────────────
+    cap_init = float(working_caps[0])
+    if cap_init <= 0:
+        raise ValueError(f"[{battery_id}] cap_init <= 0 after imputation ({cap_init:.4f}).")
+
+    soh = (working_caps / cap_init).astype(np.float32)
+
+    # ── 4. Optional diagnostic print ─────────────────────────────────────
+    if verbose_diag:
+        tag = "[VDoD-fixed]" if vdod_flag else "[normal]"
+        print(f"\n  DIAG {tag} {battery_id}")
+        print(f"    raw caps first 10 : {caps[:10].tolist()}")
+        print(f"    raw caps last  10 : {caps[-10:].tolist()}")
+        if vdod_flag:
+            print(f"    imputed caps first10: {working_caps[:10].tolist()}")
+        print(f"    cap_init = {cap_init:.4f} Ah")
+        print(f"    SoH min={soh.min():.4f}  max={soh.max():.4f}\n")
+
+    # ── 5. EOL detection ─────────────────────────────────────────────────
     below_eol = np.where(soh <= eol_threshold)[0]
     if len(below_eol) > 0:
         eol_idx = int(below_eol[0])
     else:
-        eol_idx = len(soh) - 1
-        warnings.warn("EOL threshold not reached; using last cycle as EOL proxy.")
+        eol_idx = n - 1
+        warnings.warn(
+            f"EOL threshold ({eol_threshold:.0%}) not reached; "
+            f"SoH min = {soh.min():.3f}. Using last cycle as EOL proxy."
+        )
 
-    rul = np.maximum(eol_idx - np.arange(len(soh)), 0).astype(np.float32)
+    rul = np.maximum(eol_idx - np.arange(n), 0).astype(np.float32)
+    return soh, rul, eol_idx
 
-    return soh.astype(np.float32), rul, eol_idx
+
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -154,11 +246,25 @@ def build_feature_matrix(
         })
 
         # ── SoH / RUL ─────────────────────────────────────────────
+        # Print diagnostics for the first normal and first satellite battery.
+        _IS_SAT = "satellite" in battery_id.lower()
+        _diag = getattr(build_feature_matrix, "_diag_normal_done", False) is False and not _IS_SAT or \
+                getattr(build_feature_matrix, "_diag_sat_done",    False) is False and _IS_SAT
         try:
-            soh, rul, eol_idx = compute_soh_rul(batt.discharge_capacity, eol_threshold)
+            soh, rul, eol_idx = compute_soh_rul(
+                batt.discharge_capacity,
+                eol_threshold,
+                battery_id=battery_id,
+                verbose_diag=_diag,
+            )
+            if _diag and not _IS_SAT:
+                build_feature_matrix._diag_normal_done = True
+            if _diag and _IS_SAT:
+                build_feature_matrix._diag_sat_done = True
         except ValueError as exc:
             warnings.warn(f"[{battery_id}] SoH computation failed: {exc} — skipping.")
             continue
+
 
         df_bat["SoH"]         = soh
         df_bat["RUL"]         = rul

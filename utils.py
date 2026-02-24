@@ -87,18 +87,21 @@ class EarlyStopping:
         return model
 
 
-def _save_fig(fig: Figure, save_path: str) -> None:
+#def _save_fig(fig: Figure, save_path: str) -> None:
     """
     Render a matplotlib Figure to PNG via BytesIO and write to disk.
     Avoids all PIL file-open logic (which fails on Python 3.14 + Windows paths
     with spaces when called from certain internal matplotlib code paths).
     """
-    canvas = FigureCanvasAgg(fig)
-    canvas.draw()
-    buf = io.BytesIO()
-    canvas.print_png(buf)
-    buf.seek(0)
-    Path(save_path).write_bytes(buf.read())
+def _save_fig(fig, save_path):
+    from pathlib import Path
+    import matplotlib.pyplot as plt
+
+    save_path = Path(save_path)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fig.savefig(save_path, bbox_inches="tight", dpi=300)
+    plt.close(fig)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -170,8 +173,9 @@ def plot_attention_heatmap(
     weights = weights[:max_samples]            # (M, seq_len)
     n_samples, seq_len = weights.shape
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig = Figure(figsize=(14, 5))
     fig.suptitle("Attention Weight Analysis", fontsize=14, fontweight="bold")
+    axes = fig.subplots(1, 2)
 
     # ── Left: heatmap ────────────────────────────────────────────
     im = axes[0].imshow(weights, aspect="auto", cmap="viridis",
@@ -179,7 +183,7 @@ def plot_attention_heatmap(
     axes[0].set_xlabel("Sequence Position (Cycle Index within Window)")
     axes[0].set_ylabel("Sample Index")
     axes[0].set_title("Attention Weights Heatmap")
-    plt.colorbar(im, ax=axes[0], label="Weight")
+    fig.colorbar(im, ax=axes[0], label="Weight")   # OO API — no plt.colorbar
 
     # ── Right: mean attention profile ────────────────────────────
     mean_w = weights.mean(axis=0)    # (seq_len,)
@@ -198,10 +202,9 @@ def plot_attention_heatmap(
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    with open(save_path, "wb") as _f:
-        fig.savefig(_f, dpi=150, bbox_inches="tight", format="png")
-    plt.close(fig)
+    _save_fig(fig, save_path)
     print(f"  [Saved] {save_path}")
+
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -218,8 +221,9 @@ def plot_training_curves(log_path: str, save_path: str) -> None:
     import pandas as pd
 
     df = pd.read_csv(log_path)
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig = Figure(figsize=(14, 5))
     fig.suptitle("Training Curves", fontsize=14, fontweight="bold")
+    axes = fig.subplots(1, 2)
 
     # Loss
     axes[0].plot(df["epoch"], df["train_loss"], label="Train Loss")
@@ -231,9 +235,9 @@ def plot_training_curves(log_path: str, save_path: str) -> None:
     axes[0].grid(True, alpha=0.3)
 
     # RMSE
-    axes[1].plot(df["epoch"], df["val_soh_rmse"], label="SoH RMSE (val)")
+    axes[1].plot(df["epoch"], df["val_soh_rmse"],   label="SoH RMSE (val)")
     axes[1].plot(df["epoch"], df["train_soh_rmse"], label="SoH RMSE (train)", linestyle="--")
-    axes[1].plot(df["epoch"], df["val_rul_rmse"], label="RUL RMSE (val)")
+    axes[1].plot(df["epoch"], df["val_rul_rmse"],   label="RUL RMSE (val)")
     axes[1].plot(df["epoch"], df["train_rul_rmse"], label="RUL RMSE (train)", linestyle="--")
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("RMSE")
@@ -242,7 +246,5 @@ def plot_training_curves(log_path: str, save_path: str) -> None:
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
-    with open(save_path, "wb") as _f:
-        fig.savefig(_f, dpi=150, bbox_inches="tight", format="png")
-    plt.close(fig)
+    _save_fig(fig, save_path)
     print(f"  [Saved] {save_path}")
